@@ -43,9 +43,9 @@ this will return a sequence of:
 For all the lines in the file.
 
 "
-  (pmap (fn [[line start-pos end-pos]]
-          [(key-fn line) start-pos end-pos])
-        (line-position-seq fp)))
+  (map (fn [[line start-pos end-pos]]
+         [(key-fn line) start-pos end-pos])
+       (line-position-seq fp)))
 
 (comment
 
@@ -74,6 +74,7 @@ For all the lines in the file.
   ;; run the indexer (seq), emit to index-file
   ;; sort index-file
   (with-open [outp (ds/writer index-file)]
+    ;; NB: this can be re-written as a doseq instead of a loop/recur
     (loop [[[kvals start end] & vals] (file-index-seq input-file key-fn)]
       (if (or (nil? kvals)
               (empty? kvals))
@@ -108,13 +109,13 @@ For all the lines in the file.
   (require 'clj-etl-utils.ref-data)
   (let [rnd (java.util.Random.)
         states (vec (map first clj-etl-utils.ref-data/*us-states*))]
-   (with-open [wtr (java.io.PrintWriter. "file.txt")]
-     (dotimes [ii 100]
-       (.println wtr
-                 (str
-                      (rand-elt states)
-                      "\t"
-                      (.nextInt rnd))))))
+    (with-open [wtr (java.io.PrintWriter. "file.txt")]
+      (dotimes [ii 100]
+        (.println wtr
+                  (str
+                   (rand-elt states)
+                   "\t"
+                   (.nextInt rnd))))))
 
   (index-file! "file.txt" ".file.txt.id-idx"
                (fn [l]
@@ -211,7 +212,7 @@ index values returning records from the data file."
              (pos? direction)
              (do
                #_(println (format "direction was positive, indicating we've gone past: (compare \"%s\" \"%s\") %d"
-                                v term direction))
+                                  v term direction))
                res)
 
              :continue
@@ -241,10 +242,10 @@ index values returning records from the data file."
         :rewind
         (do
           #_(println (format "rewind-to-newline: [%d/%s] Did not find newline at %d, going back to %d"
-                           (.intValue b)
-                           ch
-                           (.getFilePointer fp)
-                           (- (.getFilePointer fp) 2)))
+                             (.intValue b)
+                             ch
+                             (.getFilePointer fp)
+                             (- (.getFilePointer fp) 2)))
           (.seek fp (- (.getFilePointer fp) 2))
           ;; (recur (dec max-iters))
           (recur))))))
@@ -254,7 +255,7 @@ index values returning records from the data file."
 ;; epos must point at either the end of the file, or a newline
 (defn index-search-prefix-impl [^String idx-file ^String term spos epos]
   #_(println (format "index-search-prefix-impl %s %s %d %d"
-                   idx-file term spos epos))
+                     idx-file term spos epos))
   (if (<= (- epos spos) min-streaming-threshold)
     (with-open [rdr (BufferedReader.
                      (InputStreamReader.
@@ -283,8 +284,8 @@ index values returning records from the data file."
               [iterm bstart bend] (.split line "\t" 3)
               order   (compare term iterm)]
           #_(println (format "Looking at[%d] line=%s"
-                           (.getFilePointer fp)
-                           line))
+                             (.getFilePointer fp)
+                             line))
           (cond
             (<= (- epos spos) min-streaming-threshold)
             (with-open [rdr (BufferedReader.
@@ -299,7 +300,7 @@ index values returning records from the data file."
                term
                (fn [idx-val term]
                  #_(println (format "(.startsWith \"%s\" \"%s\") => %s"
-                                  idx-val term (.startsWith idx-val term)))
+                                    idx-val term (.startsWith idx-val term)))
                  (.startsWith idx-val term))
                rdr))
 
@@ -335,7 +336,7 @@ index values returning records from the data file."
     (if (<= epos min-streaming-threshold)
       (do
         #_(println (format "file size %d < thresh %d, falling back to streaming"
-                         epos min-streaming-threshold))
+                           epos min-streaming-threshold))
         (index-search idx-file term #(= %1 %2)))
       (index-search-prefix-impl idx-file term 0 epos))))
 
@@ -393,6 +394,43 @@ index values returning records from the data file."
          idx-path
          (:fn idx))))))
 
+(defn make-candidate-cluster-file-next-group [index-seqs]
+  (let [nextval (first (sort (map #(first (:nextval %1)) (vals index-seqs))))]
+    [nextval index-seqs]))
+
+;; (take-while
+
+;; This sould combine the index files where they join, the format should be:
+;;  per line:
+;;    index-values that determiend the cluster
+;;    landscaped list of: [[source-file-path spos epos] ...]
+;; that way
+(defn make-candidate-cluster-file [sources index-name candfile]
+  ;; create an index seq over each source
+  (let [index-seqs (reduce (fn [acc source]
+                             (let [idx-file (index-file-path source index-name)
+                                   reader   (java.io.BufferedReader. (java.io.FileReader. idx-file))
+                                   nextline (.readLine reader)
+                                   nextval  (when-not (nil? nextline)
+                                              (vec (.split nextline "\t")))
+                                   index-seq-fn (fn index-seq-fn []
+                                                  (let [line (.readLine reader)]
+                                                    (if (nil? line)
+                                                      nil
+                                                      (lazy-cat
+                                                       [(.split line "\t")]
+                                                       (index-seq-fn)))))]
+                              (assoc acc (:name source)
+                                     {:source          (:name source)
+                                      :index-file-path idx-file
+                                      :reader          reader
+                                      :nextval         nextval})))
+                           {}
+                           sources)]
+    (doseq [[src-name cfg] index-seqs]
+      (.close (:reader cfg)))
+    (make-candidate-cluster-file-next-group index-seqs)))
+
 (defn make-candidate-keyfile [sources index-name candfile]
   ;; combine the index values, sort and count them
   (with-open [wtr (java.io.PrintWriter. candfile)]
@@ -415,22 +453,54 @@ index values returning records from the data file."
     (when-not (.exists f)
       (make-candidate-keyfile sources index-name candfile))))
 
-(defn process-candidte-clusters [sources index-name f]
-  (let [candfile (format "%s-by-%s.candidates"
-                         (string/join "" (map #(name (:name %1)) sources))
-                         (name index-name))]
-    ;; ensure indexes, then the candidate file
-    (ensure-candidate-keyfile sources index-name candfile)
-    (with-open [rdr (java.io.BufferedReader. (java.io.FileReader. candfile))]
-      (doseq [term (line-seq rdr)]
-        (let [cluster (vec (map (fn [src]
-                                  (let [input-file (-> src :config :file)
-                                        index-file (index-file-path src index-name)]
-                                    {:source     (-> src :name)
-                                     :index-file index-file
-                                     :recs       (vec (index-search-file input-file index-file term))}))
-                                sources))]
-          (f term cluster))))))
+(defn lazy-line-seq [^String fname]
+  (let [rdr (java.io.BufferedReader. (java.io.FileReader. fname))
+        lzf   (fn lzf []
+                (let [line (.readLine rdr)]
+                  (if (nil? line)
+                    (do
+                      (.close rdr)
+                      nil)
+                    (lazy-cat
+                     [line]
+                     (lzf)))))]
+    (lzf)))
 
 
+;; make a lazy seq of candidate clusters instead of this imperative
+;; approach
+(defn cand-cluster-seq [sources index-name candfile]
+  (map
+   (fn [term]
+     (let [cluster (vec (map (fn [src]
+                               (let [input-file (-> src :config :file)
+                                     index-file (index-file-path src index-name)]
+                                 {:source     (-> src :name)
+                                  :index-file index-file
+                                  :recs       (vec (index-search-file input-file index-file term))}))
+                             sources))]
+       cluster))
+   (lazy-line-seq candfile)))
 
+(defn process-candidte-clusters
+  ([sources index-name f]
+     (let [candfile (format "%s-by-%s.candidates"
+                            (string/join "" (map #(name (:name %1)) sources))
+                            (name index-name))]
+       (ensure-candidate-keyfile sources index-name candfile)
+       (process-candidte-clusters
+        sources
+        index-name
+        candfile
+        f)))
+  ([sources index-name candfile f]
+     (with-open [rdr (java.io.BufferedReader. (java.io.FileReader. candfile))]
+       (doseq [term (line-seq rdr)]
+         (let [cluster (vec (map (fn [src]
+                                   (let [input-file (-> src :config :file)
+                                         index-file (index-file-path src index-name)]
+                                     {:source     (-> src :name)
+                                      :index-file index-file
+                                      :recs       (vec (index-search-file input-file index-file term))}))
+                                 sources))]
+           (f term cluster))))))
